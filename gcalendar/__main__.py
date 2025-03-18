@@ -19,9 +19,14 @@
 import argparse
 import json
 import os
+import re
+import subprocess
+import time
 from datetime import datetime, timezone
 from os.path import join
+from pathlib import Path
 
+import dateutil
 from dateutil.relativedelta import relativedelta
 from googleapiclient.errors import HttpError
 from httplib2 import HttpLib2Error
@@ -37,6 +42,11 @@ HOME_DIRECTORY = os.environ.get('HOME') or os.path.expanduser('~')
 # ~/.config/gcalendar folder
 CONFIG_DIRECTORY = os.path.join(os.environ.get(
     'XDG_CONFIG_HOME') or os.path.join(HOME_DIRECTORY, '.config'), 'gcalendar')
+
+# ~/.cache/gcalendar folder
+CACHE_DIRECTORY = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME_DIRECTORY, ".cache"),
+                               "gcalendar",
+                               )
 
 TOKEN_FILE_SUFFIX = "_" + TOKEN_STORAGE_VERSION + ".dat"
 
@@ -76,9 +86,10 @@ def list_accounts():
     return accounts
 
 
-def reset_account(account_id, storage_path):
+def reset_account(account_id, storage_path, cache_path):
     if os.path.exists(storage_path):
         delete_if_exist(storage_path)
+        delete_if_exist(cache_path)
         if os.path.exists(storage_path):
             return "Failed to reset %s" % account_id
         else:
@@ -111,12 +122,22 @@ def print_list(obj_list, output_type):
         print(json.dumps(obj_list))
 
 
-def print_events(events, output_type):
+def format_event(event, event_format):
+    pattern = r"{(?!{)(\w+)}(?!})"
+    fields = re.findall(pattern, event_format)
+    for field in fields:
+        if field not in event:
+            return f"Invalid field name: '{field}'"
+    try:
+        return event_format.format(**event)
+    except ValueError as e:
+        return f"{e}: {event_format}"
+
+
+def print_events(events, output_type, event_format):
     if output_type == "txt":
         for event in events:
-            print("%s:%s - %s:%s\t%s\t%s\t%s" % (
-                event["start_date"], event["start_time"], event["end_date"], event["end_time"], event["summary"],
-                event["location"], event["status"]))
+            print(format_event(event, event_format))
     elif output_type == "json":
         print(json.dumps(events))
 
@@ -158,6 +179,77 @@ def handle_exception(client_id, client_secret, account_id, storage_path, output,
     return failed, None
 
 
+def interval_to_seconds(interval, negative=False):
+    seconds_per_unit = {"m": 60, "h": 3600, "d": 86400}
+    pattern = r"\s*([-+]?)(\d+)\s*(?:(h(?:our)?|m(?:inute)?|d(?:ay)?)s?)\s*"
+    time_intervals = re.findall(pattern, interval)
+    seconds = 0
+    for interval in time_intervals:
+        n = int(interval[1])
+        if negative and interval[0] != "+":
+            n = -n
+        seconds += n * seconds_per_unit[(interval[2] or "m")[0]]
+    return seconds
+
+
+def cache_path(account_id):
+    return Path(CACHE_DIRECTORY) / account_id
+
+
+def read_cached_events(account_id, cache_ttl):
+    cache = cache_path(account_id)
+    events = []
+    if cache.is_file() and time.time() < (
+            cache.stat().st_mtime + interval_to_seconds(cache_ttl)
+    ):
+        with open(cache, "r") as f:
+            events = json.load(f)
+    return events
+
+
+def cache_events(account_id, events):
+    cache = cache_path(account_id)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    with open(cache, "w") as f:
+        json.dump(events, f)
+
+
+def notify_events(events, notifier, notify_before, event_format):
+    intervals = [
+        interval_to_seconds(interval, negative=True) for interval in notify_before
+    ].sort()
+    for event in events:
+        event_desc = format_event(event, event_format)
+        event_start = dateutil.parser.parse(
+            f"{event['start_date']} {event['start_time']}"
+        )
+        event_start_00 = event_start.replace(second=00).timestamp()
+        event_start_59 = event_start.replace(second=59).timestamp()
+        for interval in intervals:
+            if (
+                    (event_start_00 + interval)
+                    <= time.time()
+                    <= (event_start_59 + interval)
+            ):
+                subprocess.run([notifier, event_desc])
+                break
+
+
+def process_events(events, args):
+    if args.notify:
+        event_format = (
+                args.event_format
+                or "{start_date} {start_time} - {end_date} {end_time}\n{summary}\n{hangoutLink}"
+        )
+        notify_events(events, args.notifier, args.notify_before, event_format)
+    else:
+        event_format = (
+                args.event_format
+                or "{start_date}:{start_time} - {end_date}:{end_time}\t{summary}\t{location}\t{status}"
+        )
+        print_events(events, args.output, event_format)
+
+
 def process_request(account_ids, args):
     client_id = args.client_id
     client_secret = args.client_secret
@@ -173,7 +265,7 @@ def process_request(account_ids, args):
         # --reset
         for account_id in account_ids:
             storage_path = join(CONFIG_DIRECTORY, account_id + TOKEN_FILE_SUFFIX)
-            status = reset_account(account_id, storage_path)
+            status = reset_account(account_id, storage_path, cache_path(account_id).as_posix())
             print_status(status, args.output)
         return 0
 
@@ -217,17 +309,21 @@ def process_request(account_ids, args):
         end_time = str((since + relativedelta(days=no_of_days)).isoformat())
         events = []
         for account_id in account_ids:
-            storage_path = join(CONFIG_DIRECTORY, account_id + TOKEN_FILE_SUFFIX)
-            failed, result = handle_exception(client_id, client_secret, account_id, storage_path, args.output,
-                                              args.debug,
-                                              lambda cal: cal.list_events(selected_calendars, start_time, end_time,
-                                                                          time_zone))
-            if failed:
-                return -1
-            else:
-                events.extend(result)
+            if not args.cache or not (
+                    result := read_cached_events(account_id, args.cache_ttl)
+            ):
+                storage_path = join(CONFIG_DIRECTORY, account_id + TOKEN_FILE_SUFFIX)
+                failed, result = handle_exception(client_id, client_secret, account_id, storage_path, args.output,
+                                                  args.debug,
+                                                  lambda cal: cal.list_events(selected_calendars, start_time, end_time,
+                                                                              time_zone))
+                if failed:
+                    return -1
+                if args.cache:
+                    cache_events(account_id, result)
+            events.extend(result)
         events = sorted(events, key=lambda event: event["start_date"] + event["start_time"])
-        print_events(events, args.output)
+        process_events(events, args)
 
 
 def main():
@@ -240,6 +336,7 @@ def main():
     group.add_argument("--list-accounts", action="store_true", help="list the id of gcalendar accounts")
     group.add_argument("--status", action="store_true", help="print the status of the gcalendar account")
     group.add_argument("--reset", action="store_true", help="reset the account")
+    group.add_argument("--notify", action="store_true", help="notify about upcoming events")
     parser.add_argument("--calendar", type=str, default=["*"], nargs="*", help="calendars to list events from")
     parser.add_argument("--since", type=validate_since, help="number of days to include")
     parser.add_argument("--no-of-days", type=str, default="7", help="number of days to include")
@@ -247,8 +344,16 @@ def main():
                         help="an alphanumeric name to uniquely identify the account")
     parser.add_argument("--output", choices=["txt", "json"], default="txt", help="output format")
     parser.add_argument("--client-id", type=str, help="the Google client id")
-    parser.add_argument("--client-secret", type=str,
-                        help="the Google client secret")
+    parser.add_argument("--client-secret", type=str, help="the Google client secret")
+    parser.add_argument("--cache", dest="cache", action="store_true", default=True,
+                        help="cache the calendar events. enabled by default")
+    parser.add_argument("--no-cache", dest="cache", action="store_false", help="skip the calendar events cache")
+    parser.add_argument("--cache-ttl", type=str, default="30m", help="ttl of cache for the calendar events")
+    parser.add_argument("--notifier", type=str, default="notify-send",
+                        help="notifier to use for upcoming events notifications")
+    parser.add_argument("--notify-before", nargs="+", type=str, default=["2m", "1m", "+0m"],
+                        help="time to notify before event")
+    parser.add_argument("--event-format", type=str, help="format of event for notification")
     parser.add_argument('--version', action='version', version='%(prog)s ' + VERSION)
     parser.add_argument("--debug", action="store_true", help="run gcalendar in debug mode")
     args = parser.parse_args()
