@@ -217,7 +217,8 @@ def cache_events(account_id, events):
 def notify_events(events, notifier, notify_before, event_format):
     intervals = [
         interval_to_seconds(interval, negative=True) for interval in notify_before
-    ].sort()
+    ]
+    intervals.sort()
     for event in events:
         event_desc = format_event(event, event_format)
         event_start = dateutil.parser.parse(
